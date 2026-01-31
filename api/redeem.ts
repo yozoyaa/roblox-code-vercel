@@ -59,8 +59,8 @@ updated AS (
 	RETURNING c.id, p.code
 ),
 logged AS (
-	INSERT INTO used_code (code_id, roblox_job_id, player_user_id)
-	SELECT id, $3, $1::bigint
+	INSERT INTO used_code (code_id, roblox_job_id, player_user_id, category)
+	SELECT id, $3, $1::bigint, $2::code_category
 	FROM updated
 	RETURNING code_id
 )
