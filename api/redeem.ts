@@ -3,6 +3,8 @@ import { sql } from "../src/db";
 import { requireEnv } from "../src/env";
 import { getHeader, readJson, sendJson } from "../src/http";
 
+const REDEEM_SECRET_KEY = requireEnv("REDEEM_SECRET_KEY");
+
 const ALLOWED_CATEGORIES = new Set(["gopay_cashback", "gopay_coins"] as const);
 type Category = "gopay_cashback" | "gopay_coins";
 
@@ -15,6 +17,35 @@ type RedeemBody = {
 export const config = {
 	runtime: "nodejs",
 };
+
+const DB_TIMEOUT_MS = 10_000;
+const MAX_JOB_ID_LEN = 128;
+
+const REDEEM_SQL = `
+WITH picked AS (
+	SELECT id, code
+	FROM codes
+	WHERE category = $1::code_category
+		AND used_at IS NULL
+	ORDER BY id
+	FOR UPDATE SKIP LOCKED
+	LIMIT 1
+),
+updated AS (
+	UPDATE codes c
+	SET used_at = now()
+	FROM picked p
+	WHERE c.id = p.id
+	RETURNING c.id, p.code
+),
+logged AS (
+	INSERT INTO used_code (code_id, roblox_job_id, player_user_id)
+	SELECT id, $2, $3
+	FROM updated
+	RETURNING code_id
+)
+SELECT code FROM updated;
+`;
 
 function parseRedeemBody(value: unknown): RedeemBody | null {
 	if (typeof value !== "object" || value == null) return null;
@@ -34,13 +65,35 @@ function parseRedeemBody(value: unknown): RedeemBody | null {
 			? playerUserIdRaw
 			: undefined;
 
-	const jobId = typeof jobIdRaw === "string" ? jobIdRaw : undefined;
+	let jobId = typeof jobIdRaw === "string" ? jobIdRaw : undefined;
+	if (jobId && jobId.length > MAX_JOB_ID_LEN) {
+		jobId = jobId.slice(0, MAX_JOB_ID_LEN);
+	}
 
 	return {
 		category: category as Category,
 		playerUserId,
 		jobId,
 	};
+}
+
+function isTimeoutError(err: unknown): boolean {
+	if (typeof err !== "object" || err == null) return false;
+	const e = err as { name?: string; message?: string };
+	return e.name === "AbortError" || (e.message ?? "").toLowerCase().includes("timed out");
+}
+
+function isConnectionError(err: unknown): boolean {
+	if (typeof err !== "object" || err == null) return false;
+	const msg = ((err as { message?: string }).message ?? "").toLowerCase();
+	return (
+		msg.includes("fetch failed") ||
+		msg.includes("ecconnreset") ||
+		msg.includes("econnreset") ||
+		msg.includes("etimedout") ||
+		msg.includes("socket") ||
+		msg.includes("network")
+	);
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -50,7 +103,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 	}
 
 	const apiKey = getHeader(req, "x-api-key");
-	if (apiKey !== requireEnv("REDEEM_SECRET_KEY")) {
+	if (apiKey !== REDEEM_SECRET_KEY) {
 		return sendJson(res, 401, { error: "UNAUTHORIZED" });
 	}
 
@@ -65,45 +118,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 	if (!body) {
 		return sendJson(res, 400, {
 			error: "INVALID_BODY",
-			expected: { category: "gopay_cashback | gopay_coins", playerUserId: "number?", jobId: "string?" },
+			expected: {
+				category: "gopay_cashback | gopay_coins",
+				playerUserId: "number?",
+				jobId: "string?",
+			},
 		});
 	}
 
-	try {
-		const rows = (await sql`
-			WITH picked AS (
-				SELECT id, code
-				FROM codes
-				WHERE category = ${body.category}::code_category
-					AND used_at IS NULL
-				ORDER BY id
-				FOR UPDATE SKIP LOCKED
-				LIMIT 1
-			),
-			updated AS (
-				UPDATE codes c
-				SET used_at = now()
-				FROM picked p
-				WHERE c.id = p.id
-				RETURNING c.id, p.code
-			),
-			logged AS (
-				INSERT INTO used_code (code_id, roblox_job_id, player_user_id)
-				SELECT id, ${body.jobId ?? null}, ${body.playerUserId ?? null}
-				FROM updated
-				RETURNING code_id
-			)
-			SELECT code FROM updated;
-		`) as { code: string }[];
+	const abortController = new AbortController();
+	const timeout = setTimeout(() => abortController.abort("timed out"), DB_TIMEOUT_MS);
 
-		const code = rows[0]?.code;
+	try {
+		const jobId = body.jobId ?? null;
+		const playerUserId = body.playerUserId ?? null;
+
+		const result = await sql.query(REDEEM_SQL, [body.category, jobId, playerUserId], {
+			fetchOptions: { signal: abortController.signal },
+			fullResults: true,
+		});
+
+		const code = (result.rows[0] as { code?: string } | undefined)?.code;
 		if (!code) {
 			return sendJson(res, 404, { error: "OUT_OF_STOCK" });
 		}
 
 		return sendJson(res, 200, { code });
 	} catch (err) {
+		if (isTimeoutError(err)) {
+			return sendJson(res, 504, { error: "DB_TIMEOUT" });
+		}
+		if (isConnectionError(err)) {
+			return sendJson(res, 503, { error: "DB_UNAVAILABLE" });
+		}
+
 		console.error("Redeem failed:", err);
 		return sendJson(res, 500, { error: "INTERNAL_ERROR" });
+	} finally {
+		clearTimeout(timeout);
 	}
 }

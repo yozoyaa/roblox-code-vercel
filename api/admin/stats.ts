@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { sql } from "../src/db";
-import { requireEnv } from "../src/env";
-import { getHeader, sendJson } from "../src/http";
+import { sql } from "../../src/db";
+import { requireEnv } from "../../src/env";
+import { getHeader, sendJson } from "../../src/http";
 
 export const config = {
 	runtime: "nodejs",
