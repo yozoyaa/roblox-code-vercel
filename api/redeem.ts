@@ -21,26 +21,30 @@ export const config = {
 const DB_TIMEOUT_MS = 10_000;
 const MAX_JOB_ID_LEN = 128;
 
-function getCategoryLockKey(category: Category): number {
-	return category === "gopay_coins" ? 1 : 2;
-}
-
+/**
+ * Atomic flow (single SQL statement + advisory lock):
+ * - Lock by (playerUserId, category) so concurrent requests don't race.
+ * - If already redeemed for that category, return ALREADY_REDEEMED without consuming a code.
+ * - Otherwise FIFO pop a code, mark used, and log to used_code.
+ */
 const REDEEM_SQL = `
 WITH lock_cte AS (
-	SELECT pg_advisory_xact_lock($1::bigint, $2::int) AS locked
+	SELECT pg_advisory_xact_lock(
+		hashtextextended(($1::text || ':' || $2::text), 0)
+	) AS locked
 ),
 existing AS (
 	SELECT c.code
 	FROM used_code u
 	JOIN codes c ON c.id = u.code_id
 	WHERE u.player_user_id = $1::bigint
-		AND c.category = $3::code_category
+		AND c.category = $2::code_category
 	LIMIT 1
 ),
 picked AS (
 	SELECT id, code
 	FROM codes
-	WHERE category = $3::code_category
+	WHERE category = $2::code_category
 		AND used_at IS NULL
 		AND NOT EXISTS (SELECT 1 FROM existing)
 	ORDER BY id
@@ -56,7 +60,7 @@ updated AS (
 ),
 logged AS (
 	INSERT INTO used_code (code_id, roblox_job_id, player_user_id)
-	SELECT id, $4, $1::bigint
+	SELECT id, $3, $1::bigint
 	FROM updated
 	RETURNING code_id
 )
@@ -148,20 +152,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
 	try {
 		const jobId = body.jobId ?? null;
-		const lockKey = getCategoryLockKey(body.category);
 
-		const result = await sql.query(
-			REDEEM_SQL,
-			[body.playerUserId, lockKey, body.category, jobId],
-			{
-				fetchOptions: { signal: abortController.signal },
-				fullResults: true,
-			}
-		);
+		const result = await sql.query(REDEEM_SQL, [body.playerUserId, body.category, jobId], {
+			fetchOptions: { signal: abortController.signal },
+			fullResults: true,
+		});
 
-		const row = result.rows[0] as { already_code?: string | null; new_code?: string | null } | undefined;
-		const alreadyCode = row?.already_code ?? null;
-		const newCode = row?.new_code ?? null;
+		const row =
+			(result.rows[0] as { already_code?: string | null; new_code?: string | null } | undefined) ??
+			{};
+		const alreadyCode = row.already_code ?? null;
+		const newCode = row.new_code ?? null;
 
 		if (alreadyCode) {
 			return sendJson(res, 409, { error: "ALREADY_REDEEMED" });
