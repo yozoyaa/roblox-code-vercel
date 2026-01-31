@@ -10,7 +10,7 @@ type Category = "gopay_cashback" | "gopay_coins";
 
 type RedeemBody = {
 	category: Category;
-	playerUserId?: number;
+	playerUserId: number;
 	jobId?: string;
 };
 
@@ -21,12 +21,28 @@ export const config = {
 const DB_TIMEOUT_MS = 10_000;
 const MAX_JOB_ID_LEN = 128;
 
+function getCategoryLockKey(category: Category): number {
+	return category === "gopay_coins" ? 1 : 2;
+}
+
 const REDEEM_SQL = `
-WITH picked AS (
+WITH lock_cte AS (
+	SELECT pg_advisory_xact_lock($1::bigint, $2::int) AS locked
+),
+existing AS (
+	SELECT c.code
+	FROM used_code u
+	JOIN codes c ON c.id = u.code_id
+	WHERE u.player_user_id = $1::bigint
+		AND c.category = $3::code_category
+	LIMIT 1
+),
+picked AS (
 	SELECT id, code
 	FROM codes
-	WHERE category = $1::code_category
+	WHERE category = $3::code_category
 		AND used_at IS NULL
+		AND NOT EXISTS (SELECT 1 FROM existing)
 	ORDER BY id
 	FOR UPDATE SKIP LOCKED
 	LIMIT 1
@@ -40,11 +56,14 @@ updated AS (
 ),
 logged AS (
 	INSERT INTO used_code (code_id, roblox_job_id, player_user_id)
-	SELECT id, $2, $3
+	SELECT id, $4, $1::bigint
 	FROM updated
 	RETURNING code_id
 )
-SELECT code FROM updated;
+SELECT
+	(SELECT code FROM existing) AS already_code,
+	(SELECT code FROM updated) AS new_code
+FROM lock_cte;
 `;
 
 function parseRedeemBody(value: unknown): RedeemBody | null {
@@ -58,13 +77,11 @@ function parseRedeemBody(value: unknown): RedeemBody | null {
 	}
 
 	const playerUserIdRaw = body.playerUserId;
+	if (typeof playerUserIdRaw !== "number" || !Number.isFinite(playerUserIdRaw)) {
+		return null;
+	}
+
 	const jobIdRaw = body.jobId;
-
-	const playerUserId =
-		typeof playerUserIdRaw === "number" && Number.isFinite(playerUserIdRaw)
-			? playerUserIdRaw
-			: undefined;
-
 	let jobId = typeof jobIdRaw === "string" ? jobIdRaw : undefined;
 	if (jobId && jobId.length > MAX_JOB_ID_LEN) {
 		jobId = jobId.slice(0, MAX_JOB_ID_LEN);
@@ -72,7 +89,7 @@ function parseRedeemBody(value: unknown): RedeemBody | null {
 
 	return {
 		category: category as Category,
-		playerUserId,
+		playerUserId: playerUserIdRaw,
 		jobId,
 	};
 }
@@ -120,7 +137,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 			error: "INVALID_BODY",
 			expected: {
 				category: "gopay_cashback | gopay_coins",
-				playerUserId: "number?",
+				playerUserId: "number (required)",
 				jobId: "string?",
 			},
 		});
@@ -131,19 +148,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
 	try {
 		const jobId = body.jobId ?? null;
-		const playerUserId = body.playerUserId ?? null;
+		const lockKey = getCategoryLockKey(body.category);
 
-		const result = await sql.query(REDEEM_SQL, [body.category, jobId, playerUserId], {
-			fetchOptions: { signal: abortController.signal },
-			fullResults: true,
-		});
+		const result = await sql.query(
+			REDEEM_SQL,
+			[body.playerUserId, lockKey, body.category, jobId],
+			{
+				fetchOptions: { signal: abortController.signal },
+				fullResults: true,
+			}
+		);
 
-		const code = (result.rows[0] as { code?: string } | undefined)?.code;
-		if (!code) {
+		const row = result.rows[0] as { already_code?: string | null; new_code?: string | null } | undefined;
+		const alreadyCode = row?.already_code ?? null;
+		const newCode = row?.new_code ?? null;
+
+		if (alreadyCode) {
+			return sendJson(res, 409, { error: "ALREADY_REDEEMED" });
+		}
+
+		if (!newCode) {
 			return sendJson(res, 404, { error: "OUT_OF_STOCK" });
 		}
 
-		return sendJson(res, 200, { code });
+		return sendJson(res, 200, { code: newCode });
 	} catch (err) {
 		if (isTimeoutError(err)) {
 			return sendJson(res, 504, { error: "DB_TIMEOUT" });
