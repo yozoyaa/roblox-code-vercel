@@ -8,3 +8,8 @@ data/
 .DS_Store
 .vercel
 .env*.local
+.vscode/
+.idea/
+*.log
+cmd/
+TEMP_INDEX
